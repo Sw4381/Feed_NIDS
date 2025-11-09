@@ -1,204 +1,177 @@
-# FEED-NIDS 파이프라인 수정 사항
+# FEED-NIDS Pipeline v3
 
-## 주요 변경 내용
+## 개요
 
-### 1. Label 재조정 로직 추가 ✅
+네트워크 침입 탐지 시스템의 오탐을 줄이기 위한 자동화 파이프라인입니다.
 
-**파일**: `orchestrator/policy.py`
+**핵심 동작:**
+1. **Detection**: XGBoost 모델로 Attack/Normal 예측
+2. **Prioritizer**: Attack 중 하위 5% 선정 (확신도 낮은 케이스)
+3. **Knowledge Base**: Train 데이터 기반 라벨 자동 조정
+4. **Feedback**: 이전 라운드 피드백 기반 라벨 자동 조정
+5. **Merge**: 최종 결과 통합
 
-- **기능**: 유사 사례의 Label을 참조하여 자동으로 Alert의 Label 재조정
-- **재조정 기준**:
-  - `label_confidence_threshold` (기본 0.6 = 60%) 이상의 유사도를 가진 사례 발견 시
-  - 가중 투표 방식으로 최종 Label 결정
-  - Normal로 재조정 또는 Attack 확인
-
-**Decision 타입**:
-- `AUTO_ADJUST_TO_NORMAL`: 고신뢰도로 Normal로 재조정
-- `AUTO_CONFIRM_ATTACK`: 고신뢰도로 Attack 확인
-- `REFER_TO_SIMILAR`: 중신뢰도, 참고만 (원래 Label 유지)
-- `LOW_SIMILARITY`: 저신뢰도, 원래 Label 유지
-- `NO_SIMILAR_CASE`: 유사 사례 없음
-- `NO_LABELED_CASE`: 유사 사례는 있으나 Label 없음
-
-### 2. Evidence에 Label 포함 ✅
-
-**파일**: `tools/evidence_writer.py`
-
-- **변경 전**: Label이 빈 문자열("")로 저장됨
-- **변경 후**: `adjusted_label`을 Label로 저장
-- **효과**: 다음 라운드에서 유사 사례 검색 시 해당 Label 참조 가능
-
-### 3. 샘플링 비율 3%로 변경 ✅
-
-**파일**: `tools/evidence_writer.py`, `configs/config.yaml`
-
-- **변경 전**: `insertion_rate_percent = 10.0` (10%)
-- **변경 후**: `insertion_rate_percent = 3.0` (3%)
-- **샘플링 방식**: confidence 기준 오름차순 정렬 후 하위 3% 선택
-
-### 4. 파이프라인 통합 ✅
-
-**파일**: `run.py`
-
-- Decision 결과를 Evidence Writer로 전달
-- adjusted_label 반영된 CSV 생성
-- Label 변경 통계 출력
-- 라운드 로그에 `similar_found`, `label_adjusted` 추가
+**주요 특징:**
+- Annoy 기반 고속 유사도 검색 (O(log N))
+- 캐싱 시스템 (40분 → 5초)
+- SHAP 기반 설명 가능성
 
 ---
 
-## 프로세스 흐름 (수정 후)
-
-```
-1. 탐지기 모델 예측
-   ↓
-2. 게이팅 (Attack 중 하위 5% 선정)
-   ↓
-3. Evidence Pack 생성
-   ↓
-4. RAG 유사사례 검색
-   ↓
-5. ★ Label 재조정 (유사사례의 Label 참조)
-   ↓
-6. 유사사례 없는 케이스 중 하위 3% 선정
-   ↓
-7. ★ Evidence 저장 (adjusted_label 포함)
-   ↓
-8. RAG 인덱스 재구축 (다음 라운드에서 활용)
+## 설치
+```bash
+pip install pandas numpy scikit-learn joblib shap annoy xgboost
 ```
 
 ---
 
-## 주요 설정값
+## 실행 방법
 
-### `configs/config.yaml`
+### 기본 실행
+```bash
+# 전체 파이프라인 (Detection → KB → Feedback)
+python pipeline_orchestrator_v2.py --all
 
-```yaml
-decision:
-  label_confidence_threshold: 0.6  # Label 재조정 최소 유사도 (60%)
-  top_refs: 3                      # 참조할 상위 유사사례 개수
+# 특정 라운드만
+python pipeline_orchestrator_v2.py --rounds Round_1 Round_2
+```
 
-evidence:
-  not_found_sim_threshold: 0.15    # 유사사례 없음 판단 임계값 (15%)
-  insertion_rate_percent: 3.0      # Evidence 저장 비율 (3%)
+### 모드 선택
+```bash
+# KB만 적용
+python pipeline_orchestrator_v2.py --all --mode kb-only
+
+# Feedback만 적용
+python pipeline_orchestrator_v2.py --all --mode feedback-only
+```
+
+### 최적화 옵션
+```bash
+# Annoy 최적화 + 캐싱 활성화 (권장)
+python pipeline_orchestrator_v2.py --all --use-optimized-search
+
+# 캐시 강제 재빌드
+python pipeline_orchestrator_v2.py --all --force-rebuild-cache
+
+# 캐싱 비활성화
+python pipeline_orchestrator_v2.py --all --no-cache
+```
+
+---
+
+## 주요 파라미터
+
+### Detection
+```bash
+--skip-detection          # Detection 스킵
+--force-detection         # Detection 재실행
+--det-threshold 0.5       # Attack 임계값
+```
+
+### Prioritizer
+```bash
+--gate-bottom-percent 5.0 # 하위 5% 선정
+--gate-no-shap            # SHAP 비활성화
+```
+
+### Knowledge Base
+```bash
+--kb-alpha 0.3            # IP 가중치
+--kb-beta 0.4             # Cosine 가중치
+--kb-gamma 0.3            # SHAP 가중치
+--kb-threshold 0.6        # 유사도 임계값
+```
+
+### Feedback
+```bash
+--alpha 0.3               # IP 가중치
+--beta 0.4                # Cosine 가중치
+--gamma 0.3               # SHAP 가중치
+--threshold 0.6           # 유사도 임계값
+--auto-top-n 50           # AutoFeedback 선정 개수
+```
+
+### 최적화
+```bash
+--use-optimized-search    # Annoy 활성화
+--annoy-n-trees 100       # Annoy 트리 개수
+--annoy-top-k 1000        # Annoy 검색 Top-K
+--cache-dir ./cache       # 캐시 디렉토리
 ```
 
 ---
 
 ## 출력 파일
-
-### 라운드별 산출물 (`round_outputs/<Round>/`)
-
-1. **targets.csv**: 게이팅된 분석 대상
-2. **evidence_packs.jsonl**: Evidence Pack 목록
-3. **rag_candidates.jsonl**: RAG 검색 결과 (상위 20개)
-4. **decisions.jsonl**: ★ Label 재조정 결과
-   - `adjusted_label`: 재조정된 Label
-   - `confidence`: 재조정 확신도
-   - `reference_cases`: 참조한 유사사례
-   - `reasoning`: 재조정 근거
-5. **predictions_with_adjusted.csv**: ★ adjusted_label 포함된 전체 예측 결과
-6. **evidence_inserted_ids.txt**: Evidence DB에 저장된 ID 목록
-7. **round_summary.json**: 라운드 요약 통계
-
-### Evidence DB (`evidence_db/`)
-
-1. **packs.jsonl**: ★ Label이 포함된 Evidence Pack 저장소
-2. **evidence_index.jsonl**: 인덱스 파일
-
-### 전체 로그 (`round_outputs/`)
-
-- **round_log.csv**: 라운드별 집계
-  - `gated`: 게이팅 대상 수
-  - `similar_found`: 유사사례 발견 수
-  - `label_adjusted`: Label 재조정 수
-  - `not_found`: 유사사례 없음 수
-  - `inserted`: Evidence DB 저장 수
-
----
-
-## 사용 방법
-
-### 1. 실행
-
-```bash
-python run.py
 ```
+round_predictions/
+├── {Round}_with_predictions.csv          # Detection 결과
+├── {Round}_kb_applied.csv                # KB 적용 결과
+└── {Round}_with_predictions_applied.csv  # 최종 결과
 
-### 2. 설정 변경
+feedback_cases/
+└── {Round}_low_confidence_cases.csv      # Prioritizer 결과
 
-`configs/config.yaml` 파일에서 파라미터 조정
+round_predictions_applied/
+└── {Round}_position_aware_optimal.csv    # Feedback 적용 결과
 
-### 3. Label 재조정 확인
-
-각 라운드의 `decisions.jsonl` 파일 확인:
-
-```json
-{
-  "alert_id": "Round_1-0001",
-  "decision": "AUTO_ADJUST_TO_NORMAL",
-  "adjusted_label": "Normal",
-  "original_label": "Attack",
-  "confidence": 0.85,
-  "reference_cases": [
-    {
-      "ref_id": "...",
-      "label": "Normal",
-      "similarity": 0.87
-    }
-  ],
-  "reasoning": "유사도 0.87로 2개 사례에서 Normal로 재조정"
-}
+cache/
+├── kb_index/                             # KB 캐시
+└── feedback_corpus/                      # Feedback 캐시
 ```
 
 ---
 
-## 검증 포인트
+## 유사도 계산
+```
+S = α × S_IP + β × S_Cosine + γ × S_SHAP
 
-### ✅ 확인 사항
-
-1. **Evidence DB의 Label 확인**
-   ```bash
-   cat evidence_db/packs.jsonl | jq '.label'
-   ```
-
-2. **Label 재조정 통계 확인**
-   ```bash
-   cat round_outputs/round_log.csv
-   ```
-
-3. **재조정 케이스 상세 확인**
-   - `round_outputs/<Round>/decisions.jsonl` 에서 `adjusted_label != original_label` 케이스 확인
+- S_IP: IP 주소 일치도 (0 or 1)
+- S_Cosine: StandardScaler 정규화 후 코사인 유사도
+- S_SHAP: SHAP Top-K 피처 랭킹 오버랩
+```
 
 ---
 
 ## 문제 해결
+```bash
+# Annoy 미설치
+pip install annoy
 
-### Label이 여전히 비어있는 경우
+# 캐시 무효화
+python pipeline_orchestrator_v2.py --all --force-rebuild-cache
 
-1. `decision.label_confidence_threshold` 값 조정 (낮추기)
-2. RAG 검색이 제대로 되는지 확인 (`rag_candidates.jsonl`)
-3. Evidence DB에 Label이 있는 사례가 충분한지 확인
+# 메모리 부족
+python pipeline_orchestrator_v2.py --all --chunk-size 500
 
-### 재조정이 너무 적은 경우
+# SHAP 에러
+python pipeline_orchestrator_v2.py --all --gate-no-shap
 
-- `decision.label_confidence_threshold`를 0.5 이하로 낮추기
-- `rag.coarse_k` 증가 (더 많은 후보 검색)
+# 라벨 조정 너무 적음
+python pipeline_orchestrator_v2.py --all --kb-threshold 0.4 --threshold 0.4
 
-### 재조정이 너무 많은 경우
-
-- `decision.label_confidence_threshold`를 0.7 이상으로 높이기
-- `evidence.not_found_sim_threshold` 증가 (더 엄격한 필터링)
+# 라벨 조정 너무 많음
+python pipeline_orchestrator_v2.py --all --kb-threshold 0.8 --threshold 0.8
+```
 
 ---
 
-## 변경 파일 목록
+## 디렉토리 구조
+```
+필수 디렉토리:
+- test_rounds/          # 입력 데이터 (Round_*.csv)
+- Train_Cases/          # KB 데이터 (labeled CSV)
+- models/               # 학습된 모델 (.joblib)
 
-1. ✅ `orchestrator/policy.py` - 신규 생성 (Label 재조정 로직)
-2. ✅ `tools/evidence_writer.py` - 수정 (Label 포함 저장)
-3. ✅ `run.py` - 수정 (Decision-Evidence 연계)
-4. ✅ `configs/config.yaml` - 수정 (3% 샘플링, 임계값 설정)
-5. ✅ `tools/detection.py` - 유지
-6. ✅ `tools/prioritizer.py` - 유지
-7. ✅ `tools/evidence_pack.py` - 유지
-8. ✅ `tools/feedback_search.py` - 유지
+자동 생성:
+- round_predictions/
+- feedback_cases/
+- round_predictions_applied/
+- cache/
+```
+
+---
+
+## 요구사항
+
+- Python 3.8+
+- pandas, numpy, scikit-learn, joblib, shap, annoy, xgboost
